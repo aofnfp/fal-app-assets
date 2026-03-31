@@ -17,7 +17,8 @@ app-asset-forge/
 │   ├── generate.sh             — Generate any asset via Fal.ai queue API
 │   ├── generate_bundle.py      — Resize master image into all platform sizes
 │   ├── upload.sh               — Upload local files to Fal CDN
-│   └── search-models.sh        — Discover Fal.ai models
+│   ├── search-models.sh        — Discover Fal.ai models
+│   └── lib.sh                  — Shared utilities (retry, JSON safety, env loading)
 └── app-asset-forge.skill       — Packaged skill file for one-click install
 ```
 
@@ -60,6 +61,18 @@ python scripts/generate_bundle.py \
   --platforms ios android web \
   --output-dir ./assets/
 ```
+
+## Self-Healing & Reliability
+
+All scripts include built-in resilience:
+
+- **Automatic retry** — 3 attempts with exponential backoff on network errors, rate limits (429), and server errors (5xx)
+- **Model fallback** — if a model fails, alternatives are tried automatically (e.g., `recraft/v4` → `recraft-v3` → `flux-2-flex`)
+- **Curl timeouts** — connect timeout (10s) and max time (120s) prevent indefinite hangs
+- **JSON safety** — special characters in prompts are escaped to prevent payload corruption
+- **Output validation** — results are checked for valid media URLs before reporting success
+- **Safe `.env` loading** — parsed line-by-line instead of shell-executed
+- **Health check** — `--health-check` flag to test API connectivity before generation
 
 ## Installation
 

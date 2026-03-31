@@ -23,6 +23,7 @@ One-stop skill for generating every visual asset an app needs — icons, logos, 
 | `scripts/generate_bundle.py` | Resize a master image into all platform sizes (Python/Pillow) |
 | `scripts/upload.sh` | Upload local files to Fal CDN |
 | `scripts/search-models.sh` | Search and discover Fal.ai models |
+| `scripts/lib.sh` | Shared utilities: retry, JSON safety, env loading, error detection |
 
 ## Prerequisites
 
@@ -556,6 +557,63 @@ This skill is designed to grow:
 - **Localization**: Text assets in multiple languages via Ideogram V3
 - **3D/AR assets**: Extend as Fal.ai adds 3D model generation → `fal-ai/triposr`
 
+## Self-Healing & Reliability
+
+All scripts include built-in resilience features that handle transient failures automatically.
+
+### Automatic Retry
+
+Every HTTP request retries up to 3 times with exponential backoff (1s, 2s, 4s) on:
+- Network errors (DNS, connection refused, timeout)
+- HTTP 429 (rate limited)
+- HTTP 5xx (server errors)
+
+Non-retryable 4xx errors (bad request, auth failure) fail immediately.
+
+### Curl Timeouts
+
+All requests include `--connect-timeout 10` and `--max-time 120` to prevent indefinite hangs. Status polling uses shorter timeouts (`--max-time 30`).
+
+### Model Fallback Chains
+
+When a model fails, `generate.sh` automatically tries alternatives:
+
+| Primary | Fallback 1 | Fallback 2 |
+|---------|-----------|-----------|
+| `recraft/v4/svg` | `recraft/v4` | `recraft-v3/svg` |
+| `recraft/v4` | `recraft-v3` | `flux-2-flex` |
+| `ideogram/v3` | `ideogram/v2a` | `recraft/v4` |
+| `flux-2-flex` | `flux/dev` | `flux/schnell` |
+| `nano-banana/v2` | `nano-banana` | `flux-2-flex` |
+
+Disable with `--no-fallback` to fail on the primary model only.
+
+### API Health Check
+
+Test connectivity before submitting jobs:
+
+```bash
+bash scripts/generate.sh --health-check
+```
+
+Verifies network reachability and API key validity.
+
+### JSON Safety
+
+Prompts containing quotes, backslashes, and newlines are automatically escaped before JSON embedding. This prevents payload corruption from special characters in user prompts.
+
+### Output Validation
+
+After generation completes, the result is validated to confirm it contains actual media URLs before reporting success.
+
+### Safe `.env` Loading
+
+The `.env` file is parsed line-by-line (matching `KEY=VALUE` patterns only) rather than shell-executed. This prevents arbitrary code execution from malformed `.env` files.
+
+### Cleanup on Failure
+
+Temporary files created during execution are automatically cleaned up on exit, interruption (Ctrl+C), or termination.
+
 ## Troubleshooting
 
 ### API Key Error
@@ -565,7 +623,13 @@ Error: FAL_KEY not set
 Run: `export FAL_KEY=your_key_here` or add to `.env` file.
 
 ### Timeout on Video
-Video generation takes 30-60+ seconds. Use queue mode (default) or `--async` flag, then poll with `--status`.
+Video generation takes 30-60+ seconds. Use queue mode (default) or `--async` flag, then poll with `--status`. Increase timeout with `--timeout 900` for very long jobs.
+
+### Rate Limiting (429)
+Automatic retry handles transient rate limits. If persistent, wait a few minutes or check your Fal.ai plan limits at https://fal.ai/dashboard.
+
+### Model Unavailable
+If a model returns errors, the fallback chain will automatically try alternatives. To force a specific model, use `--no-fallback`. Check model availability with `--health-check`.
 
 ### Text Rendering Issues
 If text is garbled: switch to Ideogram V3. If text is close but slightly wrong: try again with the exact same prompt (different seed). Keep text to 1-4 words.

@@ -11,13 +11,16 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
+register_cleanup
+
 FAL_TOKEN_ENDPOINT="https://rest.alpha.fal.ai/storage/auth/token?storage_type=fal-cdn-v3"
+MAX_FILE_SIZE=$((100 * 1024 * 1024))  # 100MB
 FILE_PATH=""
 
-# Load .env if exists
-if [ -f ".env" ]; then
-    source .env 2>/dev/null || true
-fi
+# Load .env safely (no arbitrary code execution)
+safe_load_env
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -82,10 +85,14 @@ case "$EXTENSION_LOWER" in
 esac
 
 FILE_SIZE=$(wc -c < "$FILE_PATH" | tr -d ' ')
+if [ "$FILE_SIZE" -gt "$MAX_FILE_SIZE" ]; then
+    echo "Error: File too large ($((FILE_SIZE / 1024 / 1024))MB). Maximum is 100MB." >&2
+    exit 1
+fi
 echo "Uploading $FILENAME ($((FILE_SIZE / 1024))KB, $CONTENT_TYPE)..." >&2
 
 # Step 1: Get CDN token
-TOKEN_RESPONSE=$(curl -s -X POST "$FAL_TOKEN_ENDPOINT" \
+TOKEN_RESPONSE=$(curl_with_retry -X POST "$FAL_TOKEN_ENDPOINT" \
     -H "Authorization: Key $FAL_KEY" \
     -H "Content-Type: application/json" -d '{}')
 
@@ -100,15 +107,14 @@ if [ -z "$CDN_TOKEN" ] || [ -z "$CDN_BASE_URL" ]; then
 fi
 
 # Step 2: Upload file
-UPLOAD_RESPONSE=$(curl -s -X POST "${CDN_BASE_URL}/files/upload" \
+UPLOAD_RESPONSE=$(curl_with_retry -X POST "${CDN_BASE_URL}/files/upload" \
     -H "Authorization: $CDN_TOKEN_TYPE $CDN_TOKEN" \
     -H "Content-Type: $CONTENT_TYPE" \
     -H "X-Fal-File-Name: $FILENAME" \
     --data-binary "@$FILE_PATH")
 
-if echo "$UPLOAD_RESPONSE" | grep -q '"error"'; then
-    ERROR_MSG=$(echo "$UPLOAD_RESPONSE" | grep -o '"message":"[^"]*"' | head -1 | cut -d'"' -f4)
-    echo "Upload error: $ERROR_MSG" >&2
+if check_error_response "$UPLOAD_RESPONSE"; then
+    echo "Upload error: $(get_error_message "$UPLOAD_RESPONSE")" >&2
     exit 1
 fi
 

@@ -8,13 +8,15 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
+register_cleanup
+
 CATEGORY=""
 QUERY=""
 
-# Load .env if exists
-if [ -f ".env" ]; then
-    source .env 2>/dev/null || true
-fi
+# Load .env safely (no arbitrary code execution)
+safe_load_env
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -59,13 +61,13 @@ BASE_URL="https://api.fal.ai/v1/models"
 if [ -n "$CATEGORY" ]; then
     echo "Searching models in category: $CATEGORY..." >&2
     ENCODED_CAT=$(echo "$CATEGORY" | sed 's/ /%20/g')
-    RESPONSE=$(curl -s -X GET "${BASE_URL}?category=${ENCODED_CAT}" \
+    RESPONSE=$(curl_with_retry -X GET "${BASE_URL}?category=${ENCODED_CAT}" \
         -H "Authorization: Key ${FAL_KEY:-}" \
         -H "Content-Type: application/json")
 elif [ -n "$QUERY" ]; then
     echo "Searching models for: $QUERY..." >&2
     ENCODED_QUERY=$(echo "$QUERY" | sed 's/ /%20/g')
-    RESPONSE=$(curl -s -X GET "${BASE_URL}?query=${ENCODED_QUERY}" \
+    RESPONSE=$(curl_with_retry -X GET "${BASE_URL}?query=${ENCODED_QUERY}" \
         -H "Authorization: Key ${FAL_KEY:-}" \
         -H "Content-Type: application/json")
 fi

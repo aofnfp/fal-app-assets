@@ -10,6 +10,10 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
+register_cleanup
+
 FAL_QUEUE_ENDPOINT="https://queue.fal.run"
 FAL_SYNC_ENDPOINT="https://fal.run"
 FAL_TOKEN_ENDPOINT="https://rest.alpha.fal.ai/storage/auth/token?storage_type=fal-cdn-v3"
@@ -34,27 +38,41 @@ SEED=""
 GUIDANCE_SCALE=""
 NUM_STEPS=""
 STRENGTH=""
+NO_FALLBACK=false
 
-# Asset type presets
-declare -A ASSET_PRESETS
-# format: "model|size|style"
-ASSET_PRESETS=(
-    ["icon"]="fal-ai/recraft/v4/svg|square|vector_illustration"
-    ["icon-text"]="fal-ai/ideogram/v3|square|"
-    ["logo"]="fal-ai/ideogram/v3|square|"
-    ["logo-symbol"]="fal-ai/recraft/v4/svg|square|vector_illustration"
-    ["splash"]="fal-ai/flux-2-flex|portrait_3_4|"
-    ["onboarding"]="fal-ai/nano-banana/v2|portrait_3_4|"
-    ["empty-state"]="fal-ai/recraft/v4|square|digital_illustration"
-    ["achievement"]="fal-ai/recraft/v4/svg|square|vector_illustration"
-    ["notification"]="fal-ai/recraft/v4/svg|square|vector_illustration"
-    ["feature-graphic"]="fal-ai/flux-2-flex|landscape_16_9|"
-    ["favicon"]="fal-ai/recraft/v4/svg|square|vector_illustration"
-    ["tab-icon"]="fal-ai/recraft/v4/svg|square|vector_illustration"
-    ["prototype"]="fal-ai/flux/schnell|square|"
-    ["badge"]="fal-ai/recraft/v4/svg|square|vector_illustration"
-    ["background"]="fal-ai/nano-banana/pro|landscape_16_9|"
-)
+# Model fallback chains — try alternatives on failure
+get_model_fallbacks() {
+    case "$1" in
+        fal-ai/recraft/v4/svg) echo "fal-ai/recraft/v4 fal-ai/recraft-v3/svg" ;;
+        fal-ai/recraft/v4)     echo "fal-ai/recraft-v3 fal-ai/flux-2-flex" ;;
+        fal-ai/ideogram/v3)    echo "fal-ai/ideogram/v2a fal-ai/recraft/v4" ;;
+        fal-ai/flux-2-flex)    echo "fal-ai/flux/dev fal-ai/flux/schnell" ;;
+        fal-ai/nano-banana/v2) echo "fal-ai/nano-banana fal-ai/flux-2-flex" ;;
+        *) echo "" ;;
+    esac
+}
+
+# Asset type presets — returns "model|size|style"
+get_asset_preset() {
+    case "$1" in
+        icon)            echo "fal-ai/recraft/v4/svg|square|vector_illustration" ;;
+        icon-text)       echo "fal-ai/ideogram/v3|square|" ;;
+        logo)            echo "fal-ai/ideogram/v3|square|" ;;
+        logo-symbol)     echo "fal-ai/recraft/v4/svg|square|vector_illustration" ;;
+        splash)          echo "fal-ai/flux-2-flex|portrait_3_4|" ;;
+        onboarding)      echo "fal-ai/nano-banana/v2|portrait_3_4|" ;;
+        empty-state)     echo "fal-ai/recraft/v4|square|digital_illustration" ;;
+        achievement)     echo "fal-ai/recraft/v4/svg|square|vector_illustration" ;;
+        notification)    echo "fal-ai/recraft/v4/svg|square|vector_illustration" ;;
+        feature-graphic) echo "fal-ai/flux-2-flex|landscape_16_9|" ;;
+        favicon)         echo "fal-ai/recraft/v4/svg|square|vector_illustration" ;;
+        tab-icon)        echo "fal-ai/recraft/v4/svg|square|vector_illustration" ;;
+        prototype)       echo "fal-ai/flux/schnell|square|" ;;
+        badge)           echo "fal-ai/recraft/v4/svg|square|vector_illustration" ;;
+        background)      echo "fal-ai/nano-banana/pro|landscape_16_9|" ;;
+        *) echo "" ;;
+    esac
+}
 
 # Check for --add-fal-key first
 for arg in "$@"; do
@@ -78,10 +96,8 @@ for arg in "$@"; do
     fi
 done
 
-# Load .env if exists
-if [ -f ".env" ]; then
-    source .env 2>/dev/null || true
-fi
+# Load .env safely (no arbitrary code execution)
+safe_load_env
 
 # Parse arguments
 ASSET_TYPE=""
@@ -137,11 +153,22 @@ while [[ $# -gt 0 ]]; do
             MAX_POLL_TIME="$2"; shift 2 ;;
         --lifecycle)
             LIFECYCLE="$2"; shift 2 ;;
+        --health-check)
+            if [ -z "$FAL_KEY" ]; then
+                echo "Error: FAL_KEY not set" >&2; exit 1
+            fi
+            if check_api_health "$FAL_KEY"; then
+                exit 0
+            else
+                exit 1
+            fi ;;
+        --no-fallback)
+            NO_FALLBACK=true; shift ;;
         --schema)
             SCHEMA_MODEL="${2:-$MODEL}"
             ENCODED=$(echo "$SCHEMA_MODEL" | sed 's/\//%2F/g')
             echo "Fetching schema for $SCHEMA_MODEL..." >&2
-            curl -s "https://fal.ai/api/openapi/queue/openapi.json?endpoint_id=$ENCODED"
+            curl_with_retry "https://fal.ai/api/openapi/queue/openapi.json?endpoint_id=$ENCODED"
             exit 0 ;;
         --help|-h)
             echo "App Asset Forge — Generate App Assets via Fal.ai" >&2
@@ -182,6 +209,11 @@ while [[ $# -gt 0 ]]; do
             echo "" >&2
             echo "Mode:  (default)=queue, --async, --sync, --logs" >&2
             echo "Queue: --status ID, --result ID, --cancel ID" >&2
+            echo "" >&2
+            echo "Reliability:" >&2
+            echo "  --health-check    Test API connectivity" >&2
+            echo "  --no-fallback     Disable model fallback on failure" >&2
+            echo "" >&2
             echo "Other: --schema [MODEL], --add-fal-key, --timeout N" >&2
             exit 0 ;;
         *) shift ;;
@@ -189,8 +221,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Apply asset type preset if specified
-if [ -n "$ASSET_TYPE" ] && [ -n "${ASSET_PRESETS[$ASSET_TYPE]}" ]; then
-    IFS='|' read -r PRESET_MODEL PRESET_SIZE PRESET_STYLE <<< "${ASSET_PRESETS[$ASSET_TYPE]}"
+PRESET_VALUE=$(get_asset_preset "$ASSET_TYPE")
+if [ -n "$ASSET_TYPE" ] && [ -n "$PRESET_VALUE" ]; then
+    IFS='|' read -r PRESET_MODEL PRESET_SIZE PRESET_STYLE <<< "$PRESET_VALUE"
     # Only override if user didn't explicitly set
     if [ "$MODEL" = "fal-ai/recraft/v4" ]; then
         MODEL="$PRESET_MODEL"
@@ -238,7 +271,7 @@ if [ -n "$IMAGE_FILE" ]; then
 
     echo "Uploading $FILENAME..." >&2
 
-    TOKEN_RESPONSE=$(curl -s -X POST "$FAL_TOKEN_ENDPOINT" \
+    TOKEN_RESPONSE=$(curl_with_retry -X POST "$FAL_TOKEN_ENDPOINT" \
         -H "Authorization: Key $FAL_KEY" \
         -H "Content-Type: application/json" -d '{}')
 
@@ -251,15 +284,14 @@ if [ -n "$IMAGE_FILE" ]; then
         exit 1
     fi
 
-    UPLOAD_RESPONSE=$(curl -s -X POST "${CDN_BASE_URL}/files/upload" \
+    UPLOAD_RESPONSE=$(curl_with_retry -X POST "${CDN_BASE_URL}/files/upload" \
         -H "Authorization: $CDN_TOKEN_TYPE $CDN_TOKEN" \
         -H "Content-Type: $CONTENT_TYPE" \
         -H "X-Fal-File-Name: $FILENAME" \
         --data-binary "@$IMAGE_FILE")
 
-    if echo "$UPLOAD_RESPONSE" | grep -q '"error"'; then
-        ERROR_MSG=$(echo "$UPLOAD_RESPONSE" | grep -o '"message":"[^"]*"' | head -1 | cut -d'"' -f4)
-        echo "Upload error: $ERROR_MSG" >&2
+    if check_error_response "$UPLOAD_RESPONSE"; then
+        echo "Upload error: $(get_error_message "$UPLOAD_RESPONSE")" >&2
         exit 1
     fi
 
@@ -283,7 +315,7 @@ case $ACTION in
         [ -z "$REQUEST_ID" ] && echo "Error: Request ID required for --status" >&2 && exit 1
         LOGS_PARAM=""; [ "$SHOW_LOGS" = true ] && LOGS_PARAM="?logs=1"
         echo "Checking status for $REQUEST_ID..." >&2
-        RESPONSE=$(curl -s -X GET "$FAL_QUEUE_ENDPOINT/$MODEL/requests/$REQUEST_ID/status$LOGS_PARAM" "${HEADERS[@]}")
+        RESPONSE=$(curl_with_retry -X GET "$FAL_QUEUE_ENDPOINT/$MODEL/requests/$REQUEST_ID/status$LOGS_PARAM" "${HEADERS[@]}")
         STATUS=$(echo "$RESPONSE" | grep -oE '"status"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*: *"//' | sed 's/"$//')
         echo "Status: $STATUS" >&2
         if [ "$STATUS" = "IN_QUEUE" ]; then
@@ -294,10 +326,9 @@ case $ACTION in
     result)
         [ -z "$REQUEST_ID" ] && echo "Error: Request ID required for --result" >&2 && exit 1
         echo "Getting result for $REQUEST_ID..." >&2
-        RESPONSE=$(curl -s -X GET "$FAL_QUEUE_ENDPOINT/$MODEL/requests/$REQUEST_ID" "${HEADERS[@]}")
-        if echo "$RESPONSE" | grep -q '"error"'; then
-            ERROR_MSG=$(echo "$RESPONSE" | grep -o '"message":"[^"]*"' | head -1 | cut -d'"' -f4)
-            echo "Error: $ERROR_MSG" >&2; exit 1
+        RESPONSE=$(curl_with_retry -X GET "$FAL_QUEUE_ENDPOINT/$MODEL/requests/$REQUEST_ID" "${HEADERS[@]}")
+        if check_error_response "$RESPONSE"; then
+            echo "Error: $(get_error_message "$RESPONSE")" >&2; exit 1
         fi
         if echo "$RESPONSE" | grep -q '"video"'; then
             URL=$(echo "$RESPONSE" | grep -o '"url":"[^"]*"' | head -1 | cut -d'"' -f4)
@@ -310,7 +341,7 @@ case $ACTION in
     cancel)
         [ -z "$REQUEST_ID" ] && echo "Error: Request ID required for --cancel" >&2 && exit 1
         echo "Cancelling request $REQUEST_ID..." >&2
-        RESPONSE=$(curl -s -X PUT "$FAL_QUEUE_ENDPOINT/$MODEL/requests/$REQUEST_ID/cancel" "${HEADERS[@]}")
+        RESPONSE=$(curl_with_retry -X PUT "$FAL_QUEUE_ENDPOINT/$MODEL/requests/$REQUEST_ID/cancel" "${HEADERS[@]}")
         echo "$RESPONSE"; exit 0 ;;
 esac
 
@@ -323,11 +354,11 @@ fi
 # Build the request payload
 build_payload() {
     local payload="{"
-    payload+="\"prompt\": \"$PROMPT\""
+    payload+="\"prompt\": \"$(json_escape "$PROMPT")\""
 
     # Image-to-video / image-to-image
     if [ -n "$IMAGE_URL" ]; then
-        payload+=", \"image_url\": \"$IMAGE_URL\""
+        payload+=", \"image_url\": \"$(json_escape "$IMAGE_URL")\""
     fi
 
     # Strength (for I2I)
@@ -347,7 +378,7 @@ build_payload() {
                 *) payload+=", \"image_size\": {\"width\": 1024, \"height\": 1024}" ;;
             esac
         else
-            payload+=", \"image_size\": \"$IMAGE_SIZE\""
+            payload+=", \"image_size\": \"$(json_escape "$IMAGE_SIZE")\""
         fi
         payload+=", \"num_images\": $NUM_IMAGES"
     fi
@@ -355,7 +386,7 @@ build_payload() {
     # Recraft-specific: style and colors
     if [[ "$MODEL" == *"recraft"* ]]; then
         if [ -n "$STYLE" ]; then
-            payload+=", \"style\": \"$STYLE\""
+            payload+=", \"style\": \"$(json_escape "$STYLE")\""
         fi
         if [ -n "$COLORS" ]; then
             # Convert "#4285F4,#34A853" to [[66,133,244],[52,168,83]]
@@ -395,126 +426,199 @@ PAYLOAD=$(build_payload)
 echo "Model: $MODEL" >&2
 echo "Prompt: ${PROMPT:0:80}..." >&2
 
-# Synchronous mode
-if [ "$MODE" = "sync" ]; then
-    echo "Generating (sync mode)..." >&2
-    RESPONSE=$(curl -s -X POST "$FAL_SYNC_ENDPOINT/$MODEL" "${HEADERS[@]}" -d "$PAYLOAD")
-    if echo "$RESPONSE" | grep -q '"error"'; then
-        ERROR_MSG=$(echo "$RESPONSE" | grep -o '"message":"[^"]*"' | head -1 | cut -d'"' -f4)
-        echo "Error: $ERROR_MSG" >&2; exit 1
-    fi
-    echo "Generation complete!" >&2
-    if echo "$RESPONSE" | grep -q '"video"'; then
-        URL=$(echo "$RESPONSE" | grep -o '"url":"[^"]*"' | head -1 | cut -d'"' -f4)
-        echo "Video URL: $URL" >&2
-    elif echo "$RESPONSE" | grep -q '"images"'; then
-        URL=$(echo "$RESPONSE" | grep -o '"url":"[^"]*"' | head -1 | cut -d'"' -f4)
-        echo "Image URL: $URL" >&2
-    fi
-    echo "$RESPONSE"; exit 0
-fi
+# ──────────────────────────────────────────────
+# try_generate — submit, poll, fetch with a single model
+# Returns 0 on success (result in TRY_RESULT), 1 on failure
+# ──────────────────────────────────────────────
+TRY_RESULT=""
 
-# Queue mode — submit
-echo "Submitting to queue..." >&2
-SUBMIT_RESPONSE=$(curl -s -X POST "$FAL_QUEUE_ENDPOINT/$MODEL" "${HEADERS[@]}" -d "$PAYLOAD")
+try_generate() {
+    local try_model="$1"
+    local try_payload="$2"
+    TRY_RESULT=""
 
-if echo "$SUBMIT_RESPONSE" | grep -q '"error"'; then
-    ERROR_MSG=$(echo "$SUBMIT_RESPONSE" | grep -o '"message":"[^"]*"' | head -1 | cut -d'"' -f4)
-    echo "Error: $ERROR_MSG" >&2; exit 1
-fi
-
-REQUEST_ID=$(echo "$SUBMIT_RESPONSE" | grep -oE '"request_id"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*: *"//' | sed 's/"$//')
-STATUS_URL=$(echo "$SUBMIT_RESPONSE" | grep -oE '"status_url"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*: *"//' | sed 's/"$//')
-RESPONSE_URL=$(echo "$SUBMIT_RESPONSE" | grep -oE '"response_url"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*: *"//' | sed 's/"$//')
-
-if [ -z "$REQUEST_ID" ]; then
-    echo "Error: Failed to get request_id" >&2
-    echo "$SUBMIT_RESPONSE" >&2; exit 1
-fi
-
-echo "Request ID: $REQUEST_ID" >&2
-
-# Async mode — return immediately
-if [ "$MODE" = "async" ]; then
-    echo "" >&2
-    echo "Request submitted. Use these commands to check:" >&2
-    echo "  Status: ./generate.sh --status \"$REQUEST_ID\" --model \"$MODEL\"" >&2
-    echo "  Result: ./generate.sh --result \"$REQUEST_ID\" --model \"$MODEL\"" >&2
-    echo "  Cancel: ./generate.sh --cancel \"$REQUEST_ID\" --model \"$MODEL\"" >&2
-    echo "$SUBMIT_RESPONSE"; exit 0
-fi
-
-# Queue mode — poll until complete
-echo "Waiting for completion..." >&2
-ELAPSED=0
-LAST_STATUS=""
-
-while [ $ELAPSED -lt $MAX_POLL_TIME ]; do
-    sleep $POLL_INTERVAL
-    ELAPSED=$((ELAPSED + POLL_INTERVAL))
-
-    LOGS_PARAM=""
-    [ "$SHOW_LOGS" = true ] && LOGS_PARAM="?logs=1"
-
-    STATUS_RESPONSE=$(curl -s -X GET "${STATUS_URL}${LOGS_PARAM}" "${HEADERS[@]}")
-    STATUS=$(echo "$STATUS_RESPONSE" | grep -oE '"status"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*: *"//' | sed 's/"$//')
-
-    if [ "$STATUS" != "$LAST_STATUS" ]; then
-        case $STATUS in
-            IN_QUEUE)
-                POSITION=$(echo "$STATUS_RESPONSE" | grep -o '"queue_position":[0-9]*' | cut -d':' -f2)
-                echo "Status: IN_QUEUE (position: ${POSITION:-?})" >&2 ;;
-            IN_PROGRESS) echo "Status: IN_PROGRESS" >&2 ;;
-            COMPLETED) echo "Status: COMPLETED" >&2 ;;
-            *) echo "Status: $STATUS" >&2 ;;
-        esac
-        LAST_STATUS="$STATUS"
-    fi
-
-    if [ "$SHOW_LOGS" = true ]; then
-        LOGS=$(echo "$STATUS_RESPONSE" | grep -o '"logs":\[[^]]*\]' | head -1)
-        if [ -n "$LOGS" ] && [ "$LOGS" != "[]" ]; then
-            echo "$LOGS" | tr ',' '\n' | grep -o '"message":"[^"]*"' | cut -d'"' -f4 | while read -r log; do
-                echo "  > $log" >&2
-            done
+    # Synchronous mode
+    if [ "$MODE" = "sync" ]; then
+        echo "Generating with $try_model (sync mode)..." >&2
+        local response
+        response=$(curl_with_retry -X POST "$FAL_SYNC_ENDPOINT/$try_model" "${HEADERS[@]}" -d "$try_payload")
+        if check_error_response "$response"; then
+            echo "Error with $try_model: $(get_error_message "$response")" >&2
+            return 1
         fi
+        TRY_RESULT="$response"
+        return 0
     fi
 
-    [ "$STATUS" = "COMPLETED" ] && break
-    if [ "$STATUS" = "FAILED" ]; then
-        echo "Error: Generation failed" >&2
-        echo "$STATUS_RESPONSE"; exit 1
+    # Queue mode — submit
+    echo "Submitting to queue ($try_model)..." >&2
+    local submit_response
+    submit_response=$(curl_with_retry -X POST "$FAL_QUEUE_ENDPOINT/$try_model" "${HEADERS[@]}" -d "$try_payload")
+
+    if check_error_response "$submit_response"; then
+        echo "Error with $try_model: $(get_error_message "$submit_response")" >&2
+        return 1
+    fi
+
+    local req_id status_url response_url
+    req_id=$(echo "$submit_response" | grep -oE '"request_id"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*: *"//' | sed 's/"$//')
+    status_url=$(echo "$submit_response" | grep -oE '"status_url"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*: *"//' | sed 's/"$//')
+    response_url=$(echo "$submit_response" | grep -oE '"response_url"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*: *"//' | sed 's/"$//')
+
+    if [ -z "$req_id" ]; then
+        echo "Error: Failed to get request_id from $try_model" >&2
+        return 1
+    fi
+
+    echo "Request ID: $req_id" >&2
+
+    # Async mode — return immediately
+    if [ "$MODE" = "async" ]; then
+        echo "" >&2
+        echo "Request submitted. Use these commands to check:" >&2
+        echo "  Status: ./generate.sh --status \"$req_id\" --model \"$try_model\"" >&2
+        echo "  Result: ./generate.sh --result \"$req_id\" --model \"$try_model\"" >&2
+        echo "  Cancel: ./generate.sh --cancel \"$req_id\" --model \"$try_model\"" >&2
+        TRY_RESULT="$submit_response"
+        return 0
+    fi
+
+    # Queue mode — poll until complete
+    echo "Waiting for completion..." >&2
+    local elapsed=0 last_status="" status=""
+
+    while [ $elapsed -lt $MAX_POLL_TIME ]; do
+        sleep $POLL_INTERVAL
+        elapsed=$((elapsed + POLL_INTERVAL))
+
+        local logs_param=""
+        [ "$SHOW_LOGS" = true ] && logs_param="?logs=1"
+
+        local status_response
+        status_response=$(curl --connect-timeout 10 --max-time 30 -s -X GET \
+            "${status_url}${logs_param}" "${HEADERS[@]}" 2>/dev/null) || status_response=""
+        status=$(echo "$status_response" | grep -oE '"status"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*: *"//' | sed 's/"$//')
+
+        if [ "$status" != "$last_status" ]; then
+            case $status in
+                IN_QUEUE)
+                    local position
+                    position=$(echo "$status_response" | grep -o '"queue_position":[0-9]*' | cut -d':' -f2)
+                    echo "Status: IN_QUEUE (position: ${position:-?})" >&2 ;;
+                IN_PROGRESS) echo "Status: IN_PROGRESS" >&2 ;;
+                COMPLETED) echo "Status: COMPLETED" >&2 ;;
+                *) echo "Status: $status" >&2 ;;
+            esac
+            last_status="$status"
+        fi
+
+        if [ "$SHOW_LOGS" = true ]; then
+            local logs
+            logs=$(echo "$status_response" | grep -o '"logs":\[[^]]*\]' | head -1)
+            if [ -n "$logs" ] && [ "$logs" != "[]" ]; then
+                echo "$logs" | tr ',' '\n' | grep -o '"message":"[^"]*"' | cut -d'"' -f4 | while read -r log; do
+                    echo "  > $log" >&2
+                done
+            fi
+        fi
+
+        [ "$status" = "COMPLETED" ] && break
+        if [ "$status" = "FAILED" ]; then
+            echo "Error: Generation failed with $try_model" >&2
+            return 1
+        fi
+    done
+
+    if [ "$status" != "COMPLETED" ]; then
+        echo "Error: Timeout after ${MAX_POLL_TIME}s with $try_model" >&2
+        return 1
+    fi
+
+    # Get final result
+    echo "Fetching result..." >&2
+    local result
+    result=$(curl_with_retry -X GET "$response_url" "${HEADERS[@]}")
+
+    if check_error_response "$result"; then
+        echo "Error fetching result from $try_model: $(get_error_message "$result")" >&2
+        return 1
+    fi
+
+    TRY_RESULT="$result"
+    return 0
+}
+
+# ──────────────────────────────────────────────
+# Output validation
+# ──────────────────────────────────────────────
+validate_result() {
+    local result="$1"
+    if echo "$result" | grep -q '"url":"https://'; then
+        return 0
+    fi
+    echo "Warning: Result may not contain valid media URLs" >&2
+    return 1
+}
+
+# ──────────────────────────────────────────────
+# Generate with fallback chain
+# ──────────────────────────────────────────────
+
+# Build list of models to try
+MODELS_TO_TRY="$MODEL"
+if [ "$NO_FALLBACK" = false ]; then
+    FALLBACK_LIST=$(get_model_fallbacks "$MODEL")
+    if [ -n "$FALLBACK_LIST" ]; then
+        MODELS_TO_TRY="$MODEL $FALLBACK_LIST"
+    fi
+fi
+
+GENERATION_SUCCESS=false
+
+for CURRENT_MODEL in $MODELS_TO_TRY; do
+    if [ "$CURRENT_MODEL" != "$MODEL" ]; then
+        echo "" >&2
+        echo "Falling back to $CURRENT_MODEL..." >&2
+        # Rebuild payload for the fallback model (model-specific format may differ)
+        SAVED_MODEL="$MODEL"
+        MODEL="$CURRENT_MODEL"
+        PAYLOAD=$(build_payload)
+        MODEL="$SAVED_MODEL"
+    fi
+
+    if try_generate "$CURRENT_MODEL" "$PAYLOAD"; then
+        GENERATION_SUCCESS=true
+        if [ "$CURRENT_MODEL" != "$MODEL" ]; then
+            echo "Succeeded with fallback model: $CURRENT_MODEL" >&2
+        fi
+        break
+    fi
+
+    if [ "$NO_FALLBACK" = true ]; then
+        break
     fi
 done
 
-if [ "$STATUS" != "COMPLETED" ]; then
-    echo "Error: Timeout after ${MAX_POLL_TIME}s" >&2
-    echo "Request ID: $REQUEST_ID" >&2
-    echo "Check: ./generate.sh --status \"$REQUEST_ID\" --model \"$MODEL\"" >&2
+if [ "$GENERATION_SUCCESS" = false ]; then
+    echo "Error: Generation failed with all models" >&2
     exit 1
 fi
 
-# Get final result
-echo "Fetching result..." >&2
-RESULT=$(curl -s -X GET "$RESPONSE_URL" "${HEADERS[@]}")
-
-if echo "$RESULT" | grep -q '"error"'; then
-    ERROR_MSG=$(echo "$RESULT" | grep -o '"message":"[^"]*"' | head -1 | cut -d'"' -f4)
-    echo "Error: $ERROR_MSG" >&2; exit 1
-fi
-
+# Display result
 echo "" >&2
 echo "Generation complete!" >&2
 
-if echo "$RESULT" | grep -q '"video"'; then
-    URL=$(echo "$RESULT" | grep -o '"url":"[^"]*"' | head -1 | cut -d'"' -f4)
+if echo "$TRY_RESULT" | grep -q '"video"'; then
+    URL=$(echo "$TRY_RESULT" | grep -o '"url":"[^"]*"' | head -1 | cut -d'"' -f4)
     echo "Video URL: $URL" >&2
-elif echo "$RESULT" | grep -q '"images"'; then
-    URL=$(echo "$RESULT" | grep -o '"url":"[^"]*"' | head -1 | cut -d'"' -f4)
+elif echo "$TRY_RESULT" | grep -q '"images"'; then
+    URL=$(echo "$TRY_RESULT" | grep -o '"url":"[^"]*"' | head -1 | cut -d'"' -f4)
     echo "Image URL: $URL" >&2
 fi
 
-SEED_VAL=$(echo "$RESULT" | grep -o '"seed":[0-9]*' | cut -d':' -f2)
+validate_result "$TRY_RESULT"
+
+SEED_VAL=$(echo "$TRY_RESULT" | grep -o '"seed":[0-9]*' | cut -d':' -f2)
 [ -n "$SEED_VAL" ] && echo "Seed: $SEED_VAL (reuse for consistency)" >&2
 
-echo "$RESULT"
+echo "$TRY_RESULT"

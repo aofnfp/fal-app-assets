@@ -25,8 +25,11 @@ Environment:
 import argparse
 import json
 import os
+import shutil
 import struct
 import sys
+import time
+import urllib.error
 import urllib.request
 from io import BytesIO
 from pathlib import Path
@@ -150,6 +153,48 @@ BUNDLE_CONFIGS = {
 }
 
 
+def download_with_retry(url, max_retries=3, timeout=30):
+    """Download a URL with retry logic."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                data = response.read()
+            if not data:
+                raise ValueError("Downloaded empty response")
+            return data
+        except (urllib.error.URLError, urllib.error.HTTPError, ValueError, OSError) as e:
+            if attempt < max_retries:
+                wait = 2 ** (attempt - 1)
+                print(f"  Download failed (attempt {attempt}/{max_retries}): {e}. Retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                raise RuntimeError(f"Download failed after {max_retries} attempts: {e}") from e
+
+
+def validate_image_data(data):
+    """Validate that data is a non-empty, valid image."""
+    if not data or len(data) < 8:
+        return False
+    # Check common image magic bytes
+    if data[:8] == b'\x89PNG\r\n\x1a\n':
+        return True  # PNG
+    if data[:2] == b'\xff\xd8':
+        return True  # JPEG
+    if data[:4] == b'GIF8':
+        return True  # GIF
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return True  # WebP
+    if data[:5] == b'<?xml' or data[:4] == b'<svg':
+        return True  # SVG
+    # Try to parse with PIL as fallback
+    try:
+        Image.open(BytesIO(data))
+        return True
+    except Exception:
+        return False
+
+
 def generate_source_image(prompt, model, size, seed=None):
     """Generate the master image using Fal.ai."""
     try:
@@ -193,9 +238,10 @@ def generate_source_image(prompt, model, size, seed=None):
         print(f"Error: Unexpected API response: {list(result.keys())}")
         sys.exit(1)
 
-    # Download to memory
-    with urllib.request.urlopen(url) as response:
-        img_data = response.read()
+    # Download to memory with retry
+    img_data = download_with_retry(url)
+    if not validate_image_data(img_data):
+        print(f"Warning: Downloaded data may not be a valid image format")
 
     img = Image.open(BytesIO(img_data))
 
@@ -270,6 +316,19 @@ def generate_bundle(source_img, config, platforms, output_dir):
     output_dir = Path(output_dir)
     generated_files = []
 
+    # Count total items for progress
+    total = 0
+    for platform in platforms:
+        if platform not in config["platforms"]:
+            continue
+        _, sizes, _ = config["platforms"][platform]
+        total += sum(1 for n in sizes if not (platform == "web" and n.startswith("favicon-")))
+        if platform == "web":
+            total += 1  # ICO bundle
+    if config.get("generate_adaptive") and "android" in platforms:
+        total += len(ANDROID_ADAPTIVE_SIZES)
+    current = 0
+
     for platform in platforms:
         if platform not in config["platforms"]:
             print(f"Warning: Platform '{platform}' not configured for this asset type. Skipping.")
@@ -285,23 +344,35 @@ def generate_bundle(source_img, config, platforms, output_dir):
                 # These go into the ICO bundle
                 continue
 
+            current += 1
             filename = f"{name}.png"
-            out_path = resize_and_save(source_img, size, platform_dir / filename)
-            generated_files.append(str(out_path))
-            print(f"  {size[0]}×{size[1]} → {out_path}")
+            try:
+                out_path = resize_and_save(source_img, size, platform_dir / filename)
+                generated_files.append(str(out_path))
+                print(f"  [{current}/{total}] {size[0]}×{size[1]} → {out_path}")
+            except Exception as e:
+                print(f"  [{current}/{total}] Error resizing to {size[0]}×{size[1]}: {e}")
 
         # Generate ICO bundle for web
         if platform == "web":
-            ico_path = create_ico(source_img, platform_dir / "favicon.ico")
-            generated_files.append(str(ico_path))
-            print(f"  ICO bundle (16,32,48) → {ico_path}")
+            current += 1
+            try:
+                ico_path = create_ico(source_img, platform_dir / "favicon.ico")
+                generated_files.append(str(ico_path))
+                print(f"  [{current}/{total}] ICO bundle (16,32,48) → {ico_path}")
+            except Exception as e:
+                print(f"  [{current}/{total}] Error creating ICO: {e}")
 
     # Generate adaptive icon layers for Android
     if config.get("generate_adaptive") and "android" in platforms:
         print(f"\n--- ANDROID ADAPTIVE ICONS ---")
         adaptive_dir = output_dir / "android" / "adaptive"
-        generate_adaptive_icon(source_img, adaptive_dir, ANDROID_ADAPTIVE_SIZES)
-        generated_files.append(str(adaptive_dir))
+        try:
+            generate_adaptive_icon(source_img, adaptive_dir, ANDROID_ADAPTIVE_SIZES)
+            generated_files.append(str(adaptive_dir))
+            current += len(ANDROID_ADAPTIVE_SIZES)
+        except Exception as e:
+            print(f"  Error generating adaptive icons: {e}")
 
     return generated_files
 
@@ -371,7 +442,16 @@ Examples:
     print(f"Generating bundles for: {', '.join(args.platforms)}")
 
     # Generate all sizes
-    files = generate_bundle(source_img, config, args.platforms, args.output_dir)
+    try:
+        files = generate_bundle(source_img, config, args.platforms, args.output_dir)
+    except Exception as e:
+        print(f"\nError during bundle generation: {e}")
+        print(f"Partial output may exist in {args.output_dir}/")
+        sys.exit(1)
+
+    if not files:
+        print("\nError: No files were generated")
+        sys.exit(1)
 
     # Summary
     print(f"\n{'='*50}")
