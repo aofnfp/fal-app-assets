@@ -1,0 +1,27 @@
+# Fails any push or pull request that reintroduces the Oct 2026 "VS Code folder-open loader"
+# implant (a hidden .vscode task that runs a disguised JavaScript file with node). Added by the
+# 2026-10 incident cleanup; safe to keep permanently. It only reads files, it never runs them.
+name: implant-guard
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check for the folder-open loader implant
+        run: |
+          bad=0
+          if [ -f .vscode/tasks.json ] && grep -q folderOpen .vscode/tasks.json && grep -q node .vscode/tasks.json; then
+            echo "::error file=.vscode/tasks.json::Folder-open task that runs node (2026-10 implant). Do not open this repo in VS Code/Cursor."
+            bad=1
+          fi
+          if [ -f .gitignore ] && grep -qx 'temp_auto_push.bat' .gitignore; then
+            echo "::error file=.gitignore::.gitignore contains temp_auto_push.bat (2026-10 implant)."
+            bad=1
+          fi
+          exit $bad
