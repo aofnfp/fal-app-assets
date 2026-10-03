@@ -1,5 +1,6 @@
 # Fails any push or pull request that reintroduces the Oct 2026 "VS Code folder-open loader"
-# implant (a hidden .vscode task that runs a disguised JavaScript file with node). Added by the
+# implant (a hidden .vscode task that runs a disguised JavaScript file with node) and the padded
+# config loader (obfuscated JS hidden after a long run of whitespace in postcss/tailwind/etc. configs). Added by the
 # 2026-10 incident cleanup; safe to keep permanently. It only reads files, it never runs them.
 name: implant-guard
 on: [push, pull_request]
@@ -24,4 +25,11 @@ jobs:
             echo "::error file=.gitignore::.gitignore contains temp_auto_push.bat (2026-10 implant)."
             bad=1
           fi
+          # Padded-config loader: real code, then a long run of spaces/tabs, then obfuscated JS (_0x names).
+          hits=$(git ls-files -z -- '*.js' '*.cjs' '*.mjs' '*.ts' '*.cts' '*.mts' '*.jsx' '*.tsx' ':!:**/node_modules/**' ':!:*.min.js' \
+            | xargs -0 -r grep -lE '[[:blank:]]{80,}.*(_0x[0-9a-f]{4}|eval\(|new Function\()' 2>/dev/null || true)
+          for f in $hits; do
+            echo "::error file=$f::Hidden code after a long run of whitespace (2026-10 padded-config loader). Do not run npm in this repo."
+            bad=1
+          done
           exit $bad
